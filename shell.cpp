@@ -5,10 +5,18 @@ using namespace std;
 
 Shell::Shell():
     MAX_BUFFER(1024),
+    MAX_HISTORY(10),
     STRING_TILDE("~") {
-        exitNow = false;
-        ENV_HOME = getenv("HOME");
-        ENV_PATH = getenv("PATH");
+
+    historyIndex = 0;
+    exitNow = false;
+    ENV_HOME = getenv("HOME");
+    ENV_PATH = getenv("PATH");
+    initTermios();
+}
+
+Shell::~Shell() {
+    resetTermios();
 }
 
 vector<string> Shell::splitCommand(const string &s, const char delim) const {
@@ -21,19 +29,37 @@ vector<string> Shell::splitCommand(const string &s, const char delim) const {
 }
 
 char* Shell::trimCommand(char* cmdLine) {
-    char *s, *t;
+    char* str = cmdLine;
+    char *end;
 
-    for (s = cmdLine; whitespace (*s); ++s);
+    // Trim leading space
+    while(isspace(*str)) str++;
 
-    if (*s == 0)
-        return (s);
+    if(*str == 0)  // All spaces?
+      return str;
 
-    t = s + strlen(s) - 1;
-    while (t > s && whitespace (*t))
-        --t;
-    *++t = '\0';
+    // Trim trailing space
+    end = str + strlen(str) - 1;
+    while(end > str && isspace(*end)) end--;
 
-    return s;
+    // Write new null terminator
+    *(end+1) = 0;
+
+    return str;
+}
+
+string Shell::trimCommand(string& cmdLine) {
+    // trim trailing spaces
+    string str = cmdLine;
+    size_t endpos = str.find_last_not_of(" \t");
+    if (string::npos != endpos)
+        str = str.substr( 0, endpos+1 );
+
+    // trim leading spaces
+    size_t startpos = str.find_first_not_of(" \t");
+    if( string::npos != startpos )
+        str = str.substr(startpos);
+    return str;
 }
 
 vector<string> Shell::parseCommand(const string& cmdLine) const {
@@ -145,16 +171,110 @@ void Shell::runShell() {
         string currentDirectoryString = currentDirectory;
         if (currentDirectoryString.substr(0, ENV_HOME.size()) == ENV_HOME)
             currentDirectoryString.replace(0, ENV_HOME.size(), STRING_TILDE);
-        sprintf(cmdPrompt, "%s$ ", currentDirectoryString.c_str());
-        fflush(stdout);
+        cout << currentDirectoryString << "$ ";
+        cout.flush();
 
-        char *cmdLine = trimCommand(readline(cmdPrompt));
-        if (cmdLine)
-            add_history(cmdLine);
+        string cmdPromptString;
+        cmdPromptString = readline();
+        cmdPromptString = trimCommand(cmdPromptString);
+        if (cmdPromptString.size()) {
+            if (historyCommand.size() == 0 || historyCommand[historyCommand.size()-1] != cmdPromptString)
+                historyCommand.push_back(cmdPromptString);
+            historyIndex = historyCommand.size();
+        }
 
-        string cmdLineString = cmdLine;
-        free(cmdLine);
-
-        executeCommand(parseCommand(cmdLineString));
+        executeCommand(parseCommand(cmdPromptString));
 	} while (!exitNow);
+}
+
+static struct termios old_termios, new_termios;
+
+/* restore new terminal i/o settings */
+void Shell::resetTermios() {
+    tcsetattr(0, TCSANOW,&old_termios);
+}
+
+/* initialize new terminal i/o settings */
+void Shell::initTermios() {
+    tcgetattr(0, &old_termios); // store old terminal
+    new_termios = old_termios; // assign to new setting
+    new_termios.c_lflag &= ~ICANON; // disable buffer i/o
+    new_termios.c_lflag &= ~ECHO; // disable echo mode
+    tcsetattr(0, TCSANOW, &new_termios); // use new terminal setting
+}
+
+
+/* Detect keyboard press */
+int Shell::KeyPress() {
+    struct timeval tv = {0L, 0L};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(0, &fds);
+    return select(1, &fds, NULL, NULL, &tv);
+}
+
+string Shell::readline() {
+    int done = 0;
+    string str = "";
+
+    do {
+        if (KeyPress()) {
+            char cc = getchar();
+            switch (cc) {
+                case 27:
+                    if ((cc = getchar()) == 91) {
+                        bool historyChange = false;
+                        switch (cc = getchar()) {
+                        // User pencet atas
+                        case 65:
+                            if (historyCommand.size()) {
+                                if (historyIndex > 0) {
+                                    --historyIndex;
+                                    historyChange = true;
+                                }
+                            }
+                            break;
+                        case 66:
+                            if (historyCommand.size()) {
+                                if (historyIndex < historyCommand.size()) {
+                                    ++historyIndex;
+                                    historyChange = true;
+                                }
+                            }
+                            break;
+                        }
+                        if (historyChange) {
+                            for (unsigned int i = 0; i < str.size(); ++i)
+                                cout << "\b \b";
+
+                            if (historyIndex >= 0 && historyIndex < historyCommand.size()) {
+                                str = historyCommand[historyIndex];
+                                cout << str;
+                            }
+                            else if (historyIndex == historyCommand.size()) {
+                                str = "";
+                                cout << str;
+                            }
+                        }
+                    }
+                    break;
+                case '\n':
+                    done = 1;
+                    cout << endl;
+                    break;
+                case 127: // 127 = backspace
+                    if (str.size()) {
+                        cout << "\b \b";
+                        str.erase(str.size()-1, 1);
+                    }
+                    break;
+                default:
+                    cout << cc;
+                    str += cc;
+            }
+            cout.flush();
+        }
+    } while (!done);
+
+    return str;
 }
