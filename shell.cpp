@@ -135,27 +135,118 @@ void Shell::executeCommand(const vector<string>& vCommand) {
         */
         // Selain built-in command
         else {
-            int status;
-            pid_t pid = fork();
-            if (pid == 0) {
-                // PID anak
-                char** args;
-                args = new char*[vCommand.size()+1];
+            bool pipelined = false;
+            for (unsigned int i = 0; !pipelined && i < vCommand.size(); ++i)
+                pipelined |= vCommand[i] == "|";
+
+            if (pipelined) {
+                vector<vector<string> > vCommandPipe;
+                vector<string> vCommandArgv;
                 for (unsigned int i = 0; i < vCommand.size(); ++i) {
-                    args[i] = new char[vCommand[i].size()+1];
-                    for (unsigned int j = 0; j < vCommand[i].size(); ++j)
-                        args[i][j] = vCommand[i][j];
-                    args[i][vCommand[i].size()] = 0;
+                    if (vCommand[i] == "|") {
+                        if (i == vCommand.size()-1) {
+                            cerr << "pipelining: syntax error, expected command after '|'" << endl;
+                            cerr.flush();
+                            return;
+                        }
+                        else {
+                            vCommandPipe.push_back(vCommandArgv);
+                            vCommandArgv.clear();
+                        }
+                    }
+                    else {
+                        vCommandArgv.push_back(vCommand[i]);
+                        if (i == vCommand.size()-1)
+                            vCommandPipe.push_back(vCommandArgv);
+                    }
                 }
-                args[vCommand.size()] = 0;
-                int execStatus = execvp(args[0], args);
-                if (execStatus < 0)
-                    cerr << args[0] << ": " << strerror(errno) << endl;
-                delete [] args;
-                exit(execStatus);
+
+                vector<pid_t> vpid;
+                int npipes = 2*(vCommandPipe.size()-1);
+                int pipes[npipes];
+                for (int i = 0; i < npipes; ++i)
+                    if (pipe(pipes + 2*i) < 0) {
+                        cerr << "pipelining: error, couldn't pipe" << endl;
+                        cerr.flush();
+                    }
+
+                for (int i = 0; i < vCommandPipe.size(); ++i) {
+
+                    pid_t pid = fork();
+                    if (pid > 0)
+                        vpid.push_back(pid);
+                    else if (pid == 0) {
+                        char** args;
+                        args = new char*[vCommandPipe[i].size()+1];
+                        for (unsigned int j = 0; j < vCommandPipe[i].size(); ++j) {
+                            args[j] = new char[vCommandPipe[i].size()+1];
+                            for (unsigned int k = 0; k < vCommandPipe[i][j].size(); ++k)
+                                args[j][k] = vCommandPipe[i][j][k];
+                            args[j][vCommandPipe[i][j].size()] = 0;
+                        }
+                        args[vCommandPipe[i].size()] = 0;
+
+                        // Bukan command terakhir, bikin pipe STDOUT
+                        if (i < vCommandPipe.size()-1) {
+                            close(STDOUT_FILENO);
+                            if (dup2(pipes[2*i+1], STDOUT_FILENO) < 0)
+                                exit(EXIT_FAILURE);
+                        }
+
+                        // Bukan command pertama, bikin pipe STDIN
+                        if (i) {
+                            close(STDIN_FILENO);
+                            if (dup2(pipes[2*(i-1)], STDIN_FILENO) < 0)
+                                exit(EXIT_FAILURE);
+                        }
+
+                        for (int j = 0; j < npipes; ++j)
+                            close(pipes[j]);
+
+                        int execStatus = execvp(args[0], args);
+                        if (execStatus < 0) {
+                            cerr << args[0] << ": " << strerror(errno) << endl;
+                            cerr.flush();
+                        }
+                        delete [] args;
+                        exit(execStatus);
+                    }
+                    else {
+                        cerr << "fork: failed to create child process" << endl;
+                        return;
+                    }
+                }
+                /* Main process nunggu anaknya mati :( */
+                for (int i = 0; i < npipes; ++i)
+                    close(pipes[i]);
+                for (int i = 0 ; i < vpid.size(); ++i) {
+                    int status;
+                    waitpid(vpid[i], &status, 0);
+                }
             }
             else {
-                while (wait(&status) != pid);
+                int status;
+                pid_t pid = fork();
+                if (pid == 0) {
+                    // PID anak
+                    char** args;
+                    args = new char*[vCommand.size()+1];
+                    for (unsigned int i = 0; i < vCommand.size(); ++i) {
+                        args[i] = new char[vCommand[i].size()+1];
+                        for (unsigned int j = 0; j < vCommand[i].size(); ++j)
+                            args[i][j] = vCommand[i][j];
+                        args[i][vCommand[i].size()] = 0;
+                    }
+                    args[vCommand.size()] = 0;
+                    int execStatus = execvp(args[0], args);
+                    if (execStatus < 0)
+                        cerr << args[0] << ": " << strerror(errno) << endl;
+                    delete [] args;
+                    exit(execStatus);
+                }
+                else {
+                    while (wait(&status) != pid);
+                }
             }
         }
     }
