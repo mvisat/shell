@@ -2,21 +2,39 @@
 
 using namespace std;
 
+Shell* Shell::instance;
 
 Shell::Shell():
     MAX_BUFFER(1024),
     MAX_HISTORY(10),
     STRING_TILDE("~") {
 
+    instance = this;
     historyIndex = 0;
     exitNow = false;
     ENV_HOME = getenv("HOME");
     ENV_PATH = getenv("PATH");
     initTermios();
+
+    /* Signal handler */
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGCHLD, &SIGCHLD_HANDLER_STATIC);
 }
 
 Shell::~Shell() {
     resetTermios();
+}
+
+void Shell::SIGCHLD_HANDLER_STATIC(int sig) {
+    instance->SIGCHLD_HANDLER(sig);
+}
+
+void Shell::SIGCHLD_HANDLER(int sig) {
+//    printPrompt();
 }
 
 vector<string> Shell::splitCommand(const string &s, const char delim) const {
@@ -108,7 +126,7 @@ vector<string> Shell::parseCommand(const string& cmdLine) const {
     return vResult;
 }
 
-void Shell::executeCommand(const vector<string>& vCommand) {
+void Shell::executeCommand(vector<string>& vCommand) {
     if (vCommand.size()) {
         // exit
         if (vCommand[0] == "exit")
@@ -229,6 +247,47 @@ void Shell::executeCommand(const vector<string>& vCommand) {
                 pid_t pid = fork();
                 if (pid == 0) {
                     // PID anak
+
+                    // STDIN
+                    FILE* fileInput = NULL;
+                    for (unsigned int i = 0; fileInput == NULL && i < vCommand.size(); ++i) {
+                        if (vCommand[i] == "<") {
+                            if (i == vCommand.size()-1) {
+                                cerr << "redirect stdin: syntax error, expected filename after '<'" << endl;
+                                return;
+                            }
+                            else {
+                                fileInput = freopen(vCommand[i+1].c_str(), "r", stdin);
+                                if (fileInput == NULL) {
+                                    cerr << "redirect stdin: couldn't open the file '" << vCommand[i+1] << "'" <<  endl;
+                                    return;
+                                }
+                                vCommand.erase(vCommand.begin()+i);
+                                vCommand.erase(vCommand.begin()+i);
+                            }
+                        }
+                    }
+
+                    // STDOUT
+                    FILE* fileOutput = NULL;
+                    for (unsigned int i = 0; fileOutput == NULL && i < vCommand.size(); ++i) {
+                        if (vCommand[i] == ">") {
+                            if (i == vCommand.size()-1) {
+                                cerr << "redirect stdout: syntax error, expected filename after '>'" << endl;
+                                return;
+                            }
+                            else {
+                                fileOutput = freopen(vCommand[i+1].c_str(), "w", stdout);
+                                if (fileOutput == NULL) {
+                                    cerr << "redirect stdout: couldn't open the file '" << vCommand[i+1] << "'" << endl;
+                                    return;
+                                }
+                                vCommand.erase(vCommand.begin()+i);
+                                vCommand.erase(vCommand.begin()+i);
+                            }
+                        }
+                    }
+
                     char** args;
                     args = new char*[vCommand.size()+1];
                     for (unsigned int i = 0; i < vCommand.size(); ++i) {
@@ -238,6 +297,7 @@ void Shell::executeCommand(const vector<string>& vCommand) {
                         args[i][vCommand[i].size()] = 0;
                     }
                     args[vCommand.size()] = 0;
+
                     int execStatus = execvp(args[0], args);
                     if (execStatus < 0)
                         cerr << args[0] << ": " << strerror(errno) << endl;
@@ -252,18 +312,21 @@ void Shell::executeCommand(const vector<string>& vCommand) {
     }
 }
 
+void Shell::printPrompt() {
+    char currentDirectory[MAX_BUFFER];
+
+    // Shell menunjukkan lokasi dan direktori saat ini
+    getcwd(currentDirectory, MAX_BUFFER);
+    string currentDirectoryString = currentDirectory;
+    if (currentDirectoryString.substr(0, ENV_HOME.size()) == ENV_HOME)
+        currentDirectoryString.replace(0, ENV_HOME.size(), STRING_TILDE);
+    cout << currentDirectoryString << "$ ";
+    cout.flush();
+}
+
 void Shell::runShell() {
     do {
-        char currentDirectory[MAX_BUFFER];
-        char cmdPrompt[MAX_BUFFER+2];
-
-        // Shell menunjukkan lokasi dan direktori saat ini
-		getcwd(currentDirectory, MAX_BUFFER);
-        string currentDirectoryString = currentDirectory;
-        if (currentDirectoryString.substr(0, ENV_HOME.size()) == ENV_HOME)
-            currentDirectoryString.replace(0, ENV_HOME.size(), STRING_TILDE);
-        cout << currentDirectoryString << "$ ";
-        cout.flush();
+        printPrompt();
 
         string cmdPromptString;
         cmdPromptString = readline();
@@ -273,8 +336,8 @@ void Shell::runShell() {
                 historyCommand.push_back(cmdPromptString);
             historyIndex = historyCommand.size();
         }
-
-        executeCommand(parseCommand(cmdPromptString));
+        vector<string> vcmdPromptString = parseCommand(cmdPromptString);
+        executeCommand(vcmdPromptString);
 	} while (!exitNow);
 }
 
@@ -294,77 +357,67 @@ void Shell::initTermios() {
     tcsetattr(0, TCSANOW, &new_termios); // use new terminal setting
 }
 
-
-/* Detect keyboard press */
-int Shell::KeyPress() {
-    struct timeval tv = {0L, 0L};
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(0, &fds);
-    return select(1, &fds, NULL, NULL, &tv);
-}
-
 string Shell::readline() {
     int done = 0;
     string str = "";
 
     do {
-        if (KeyPress()) {
-            char cc = getchar();
-            switch (cc) {
-                case 27:
-                    if ((cc = getchar()) == 91) {
-                        bool historyChange = false;
-                        switch (cc = getchar()) {
-                        // User pencet atas
-                        case 65:
-                            if (historyCommand.size()) {
-                                if (historyIndex > 0) {
-                                    --historyIndex;
-                                    historyChange = true;
-                                }
+        char cc = getchar();
+        switch (cc) {
+            case 27:
+                if ((cc = getchar()) == 91) {
+                    bool historyChange = false;
+                    switch (cc = getchar()) {
+                    // User pencet atas
+                    case 65:
+                        if (historyCommand.size()) {
+                            if (historyIndex > 0) {
+                                --historyIndex;
+                                historyChange = true;
                             }
-                            break;
-                        case 66:
-                            if (historyCommand.size()) {
-                                if (historyIndex < historyCommand.size()) {
-                                    ++historyIndex;
-                                    historyChange = true;
-                                }
-                            }
-                            break;
                         }
-                        if (historyChange) {
-                            for (unsigned int i = 0; i < str.size(); ++i)
-                                cout << "\b \b";
+                        break;
+                    // User pencet bawah
+                    case 66:
+                        if (historyCommand.size()) {
+                            if (historyIndex < historyCommand.size()) {
+                                ++historyIndex;
+                                historyChange = true;
+                            }
+                        }
+                        break;
+                    // Pencet kiri sama kanan bisa tapi susah implementasinya
+                    }
+                    if (historyChange) {
+                        for (unsigned int i = 0; i < str.size(); ++i)
+                            cout << "\b \b";
 
-                            if (historyIndex >= 0 && historyIndex < historyCommand.size()) {
-                                str = historyCommand[historyIndex];
-                                cout << str;
-                            }
-                            else if (historyIndex == historyCommand.size()) {
-                                str = "";
-                                cout << str;
-                            }
+                        if (historyIndex >= 0 && historyIndex < historyCommand.size()) {
+                            str = historyCommand[historyIndex];
+                            cout << str;
+                        }
+                        else if (historyIndex == historyCommand.size()) {
+                            str = "";
+                            cout << str;
                         }
                     }
-                    break;
-                case '\n':
-                    done = 1;
-                    cout << endl;
-                    break;
-                case 127: // 127 = backspace
-                    if (str.size()) {
-                        cout << "\b \b";
-                        str.erase(str.size()-1, 1);
-                    }
-                    break;
-                default:
-                    cout << cc;
-                    str += cc;
-            }
-            cout.flush();
+                }
+                break;
+            case '\n':
+                done = 1;
+                cout << endl;
+                break;
+            case 127: // 127 = backspace
+                if (str.size()) {
+                    cout << "\b \b";
+                    str.erase(str.size()-1, 1);
+                }
+                break;
+            default:
+                cout << cc;
+                str += cc;
         }
+        cout.flush();
     } while (!done);
 
     return str;
