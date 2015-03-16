@@ -29,8 +29,11 @@ private:
     struct termios old_termios, new_termios;
     void resetTermios();
     void initTermios();
-    int KeyPress();
     string readline();
+
+    static Shell* instance;
+    static void SIGCHLD_HANDLER_STATIC(int);
+    void SIGCHLD_HANDLER(int);
 
 public:
 	Shell();
@@ -40,9 +43,9 @@ public:
     char* trimCommand(char*);
     string trimCommand(string&);
 	vector<string> parseCommand(const string&) const;
-    void executeCommand(const vector<string>&);
+    void executeCommand(vector<string>&);
+    void printPrompt();
     void runShell();
-
 
 };
 
