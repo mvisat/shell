@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <termios.h>
+#include <signal.h>
 
 #include <iostream>
 #include <sstream>
