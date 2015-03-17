@@ -14,15 +14,39 @@ Shell::Shell():
     exitNow = false;
     ENV_HOME = getenv("HOME");
     ENV_PATH = getenv("PATH");
-    initTermios();
 
-    /* Signal handler */
-    signal(SIGQUIT, SIG_IGN);
-    signal(SIGTTOU, SIG_IGN);
-    signal(SIGTTIN, SIG_IGN);
-    signal(SIGTSTP, SIG_IGN);
-    signal(SIGINT, SIG_IGN);
-    signal(SIGCHLD, &SIGCHLD_HANDLER_STATIC);
+    /* See if we are running interactively.  */
+    shell_terminal = STDIN_FILENO;
+    shell_is_interactive = isatty (shell_terminal);
+
+    if (shell_is_interactive) {
+        /* Loop until we are in the foreground.  */
+        while (tcgetpgrp (shell_terminal) != (shell_pgid = getpgrp ()))
+            kill (-shell_pgid, SIGTTIN);
+
+        /* Ignore interactive and job-control signals.  */
+        signal (SIGINT, SIG_IGN);
+        signal (SIGQUIT, SIG_IGN);
+        signal (SIGTSTP, SIG_IGN);
+        signal (SIGTTIN, SIG_IGN);
+        signal (SIGTTOU, SIG_IGN);
+        signal (SIGCHLD, &SIGCHLD_HANDLER_STATIC);
+
+        /* Put ourselves in our own process group.  */
+        shell_pgid = getpid ();
+        if (setpgid (shell_pgid, shell_pgid) < 0) {
+          cerr << "error: couldn't put the shell in its own process group" << endl;
+          exit (1);
+        }
+
+        /* Grab control of the terminal.  */
+        tcsetpgrp (shell_terminal, shell_pgid);
+
+        /* Save default terminal attributes for shell.  */
+        tcgetattr (shell_terminal, &shell_tmodes);
+
+        initTermios();
+    }
 }
 
 Shell::~Shell() {
@@ -34,7 +58,42 @@ void Shell::SIGCHLD_HANDLER_STATIC(int sig) {
 }
 
 void Shell::SIGCHLD_HANDLER(int sig) {
-//    printPrompt();
+    pid_t pid;
+    int terminationStatus;
+    pid = waitpid(WAIT_ANY, &terminationStatus, WUNTRACED | WNOHANG);
+    if (pid > 0) {
+        Job job;
+        if (!jobManager.Get(pid, job))
+            return;
+        if (WIFEXITED(terminationStatus)) {
+            if (job.status == JobBackground) {
+                cout << "[" << job.id+1 << "]+  Done\t   " << job.name << endl;
+                jobManager.Delete(job);
+            }
+        }
+        else if (WIFSIGNALED(terminationStatus)) {
+            cout << "[" << job.id+1 << "]+  Killed\t   " << job.name << endl;
+            jobManager.Delete(job);
+        }
+        else if (WIFSTOPPED(terminationStatus)) {
+            if (job.status == JobBackground) {
+                tcsetpgrp(shell_terminal, shell_pgid);
+                jobManager.Change(pid, JobWaitingInput);
+                cout << "[" << job.id+1 << "]+  Suspended\t   " << job.name << endl;
+            }
+            else {
+                tcsetpgrp(shell_terminal, job.pgid);
+                jobManager.Change(pid, JobSuspended);
+                cout << "[" << job.id+1 << "]+  Stopped\t   " << job.name << endl;
+            }
+            return;
+        }
+        else {
+            if (job.status == JobBackground)
+                jobManager.Delete(job);
+        }
+        tcsetpgrp(shell_terminal, shell_pgid);
+    }
 }
 
 vector<string> Shell::splitCommand(const string &s, const char delim) const {
@@ -145,12 +204,62 @@ void Shell::executeCommand(vector<string>& vCommand) {
         // TODO LIST
         /*
             -Built-in
-            a. jobs: Mendaftarkan semua proses yang sedang berjalan melalui shell yang anda buat beserta PID nya.
-            b. fg: Melanjutkan proses yang dihentikan dengan Ctrl+Z.
-            c. kill: Menghentikan proses yang sedang berjalan.
-            -Redirect STDIN dan STDOUT
-            -Pipeline di antara 2 proses
+            Ctrl+Z nya ga bisa T_T
         */
+        // jobs
+        else if (vCommand[0] == "jobs") {
+            jobManager.Print();
+        }
+        // fg
+        else if (vCommand[0] == "fg") {
+            Job job;
+            bool gotJob;
+            if (vCommand.size() == 1)
+                gotJob = jobManager.GetLastJob(job);
+            else {
+                stringstream ss(vCommand[1]);
+                int jobId = -1;
+                ss >> jobId;
+                gotJob = jobManager.Get(job, jobId-1);
+                if (!gotJob) {
+                    cerr << "fg: " << jobId << ": no such job" << endl;
+                }
+            }
+            if (!gotJob)
+                return;
+            if (job.status == JobSuspended || job.status == JobWaitingInput)
+                putJobForeground(job, true);
+            else
+                putJobForeground(job, false);
+        }
+        // kill
+        else if (vCommand[0] == "kill") {
+            Job job;
+            bool gotJob;
+            if (vCommand.size() == 1)
+                gotJob = jobManager.GetLastJob(job);
+            else {
+                bool byJobId = vCommand[1][0] == '%';
+                if (byJobId)
+                    vCommand[1].erase(0, 1);
+                stringstream ss(vCommand[1]);
+                int value = -1;
+                ss >> value;
+                if (byJobId)
+                    gotJob = jobManager.Get(job, value-1);
+                else
+                    gotJob = jobManager.Get(value, job);
+                if (!gotJob) {
+                    if (byJobId)
+                        cerr << "kill: " << value << ": no such job" << endl;
+                    else
+                        cerr << "kill: " << value << ": no such PID" << endl;
+                }
+            }
+            if (!gotJob)
+                return;
+            killJob(job);
+        }
         // Selain built-in command
         else {
             bool pipelined = false;
@@ -179,7 +288,6 @@ void Shell::executeCommand(vector<string>& vCommand) {
                     }
                 }
 
-                vector<pid_t> vpid;
                 int npipes = 2*(vCommandPipe.size()-1);
                 int pipes[npipes];
                 for (int i = 0; i < npipes; ++i)
@@ -188,12 +296,13 @@ void Shell::executeCommand(vector<string>& vCommand) {
                         cerr.flush();
                     }
 
+                vector<pid_t> vPID;
                 for (int i = 0; i < vCommandPipe.size(); ++i) {
 
                     pid_t pid = fork();
-                    if (pid > 0)
-                        vpid.push_back(pid);
-                    else if (pid == 0) {
+                    if (pid == 0) {
+                        resetTermios();
+
                         char** args;
                         args = new char*[vCommandPipe[i].size()+1];
                         for (unsigned int j = 0; j < vCommandPipe[i].size(); ++j) {
@@ -229,36 +338,48 @@ void Shell::executeCommand(vector<string>& vCommand) {
                         delete [] args;
                         exit(execStatus);
                     }
+                    else if (pid > 0)
+                        vPID.push_back(pid);
                     else {
                         cerr << "fork: failed to create child process" << endl;
                         return;
                     }
                 }
+
                 /* Main process nunggu anaknya mati :( */
                 for (int i = 0; i < npipes; ++i)
                     close(pipes[i]);
-                for (int i = 0 ; i < vpid.size(); ++i) {
+                for (int i = 0 ; i < vPID.size(); ++i) {
                     int status;
-                    waitpid(vpid[i], &status, 0);
+                    waitpid(vPID[i], &status, 0);
                 }
             }
             else {
+                // Background process
+                bool background = vCommand[vCommand.size()-1] == "&";
+                if (background) {
+                    vCommand.erase(vCommand.begin()+vCommand.size()-1);
+                }
+                else {
+
+                }
+
                 int status;
                 pid_t pid = fork();
                 if (pid == 0) {
-                    // PID anak
+                    resetTermios();
 
-                    // STDIN
-                    FILE* fileInput = NULL;
-                    for (unsigned int i = 0; fileInput == NULL && i < vCommand.size(); ++i) {
+                    // STDIN, diubah sesuai yang ada di reference
+                    int fileInput = -1;
+                    for (unsigned int i = 0; fileInput == -1 && i < vCommand.size(); ++i) {
                         if (vCommand[i] == "<") {
                             if (i == vCommand.size()-1) {
                                 cerr << "redirect stdin: syntax error, expected filename after '<'" << endl;
                                 return;
                             }
                             else {
-                                fileInput = freopen(vCommand[i+1].c_str(), "r", stdin);
-                                if (fileInput == NULL) {
+                                fileInput = open(vCommand[i+1].c_str(), O_RDONLY);
+                                if (fileInput == -1) {
                                     cerr << "redirect stdin: couldn't open the file '" << vCommand[i+1] << "'" <<  endl;
                                     return;
                                 }
@@ -268,17 +389,17 @@ void Shell::executeCommand(vector<string>& vCommand) {
                         }
                     }
 
-                    // STDOUT
-                    FILE* fileOutput = NULL;
-                    for (unsigned int i = 0; fileOutput == NULL && i < vCommand.size(); ++i) {
+                    // STDOUT, diubah sesuai yang ada di reference
+                    int fileOutput = -1;
+                    for (unsigned int i = 0; fileOutput == -1 && i < vCommand.size(); ++i) {
                         if (vCommand[i] == ">") {
                             if (i == vCommand.size()-1) {
                                 cerr << "redirect stdout: syntax error, expected filename after '>'" << endl;
                                 return;
                             }
                             else {
-                                fileOutput = freopen(vCommand[i+1].c_str(), "w", stdout);
-                                if (fileOutput == NULL) {
+                                fileOutput = open(vCommand[i+1].c_str(), O_WRONLY | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO);
+                                if (fileOutput == -1) {
                                     cerr << "redirect stdout: couldn't open the file '" << vCommand[i+1] << "'" << endl;
                                     return;
                                 }
@@ -287,6 +408,20 @@ void Shell::executeCommand(vector<string>& vCommand) {
                             }
                         }
                     }
+
+                    setpgrp();
+                    if (background)
+                        cout << endl << "[" << jobManager.GetActiveJobs() << "] " << getpid() << endl;
+                    else
+                        tcsetpgrp(shell_terminal, pid);
+
+                    /* Set the handling for job control signals back to the default.  */
+                    signal (SIGINT, SIG_DFL);
+                    signal (SIGQUIT, SIG_DFL);
+                    signal (SIGTSTP, SIG_DFL);
+                    signal (SIGTTIN, SIG_DFL);
+                    signal (SIGTTOU, SIG_DFL);
+                    signal (SIGCHLD, &SIGCHLD_HANDLER_STATIC);
 
                     char** args;
                     args = new char*[vCommand.size()+1];
@@ -298,14 +433,38 @@ void Shell::executeCommand(vector<string>& vCommand) {
                     }
                     args[vCommand.size()] = 0;
 
+                    if (fileInput != -1) {
+                        close(STDIN_FILENO);
+                        dup(fileInput);
+                    }
+                    if (fileOutput != -1) {
+                        close(STDOUT_FILENO);
+                        dup(fileOutput);
+                    }
+
                     int execStatus = execvp(args[0], args);
                     if (execStatus < 0)
                         cerr << args[0] << ": " << strerror(errno) << endl;
+
+                    // Cleanup
                     delete [] args;
+                    if (fileInput != -1)
+                        close(fileInput);
+                    if (fileOutput != -1)
+                        close(fileOutput);
+
                     exit(execStatus);
                 }
+                else if (pid > 0) {
+                    setpgid(pid, pid);
+                    Job job = jobManager.Insert(pid, pid, vCommand[0], background ? JobBackground : JobForeground);
+                    if (background)
+                        putJobBackground(job, false);
+                    else
+                        putJobForeground(job, false);
+                }
                 else {
-                    while (wait(&status) != pid);
+                    cerr << "fork: failed to create child process" << endl;
                 }
             }
         }
@@ -345,13 +504,12 @@ static struct termios old_termios, new_termios;
 
 /* restore new terminal i/o settings */
 void Shell::resetTermios() {
-    tcsetattr(0, TCSANOW,&old_termios);
+    tcsetattr(0, TCSANOW, &shell_tmodes);
 }
 
 /* initialize new terminal i/o settings */
 void Shell::initTermios() {
-    tcgetattr(0, &old_termios); // store old terminal
-    new_termios = old_termios; // assign to new setting
+    new_termios = shell_tmodes; // assign to new setting
     new_termios.c_lflag &= ~ICANON; // disable buffer i/o
     new_termios.c_lflag &= ~ECHO; // disable echo mode
     tcsetattr(0, TCSANOW, &new_termios); // use new terminal setting
@@ -421,4 +579,45 @@ string Shell::readline() {
     } while (!done);
 
     return str;
+}
+
+void Shell::putJobForeground(Job& job, bool continueJob) {
+    job.status = JobForeground;
+    tcsetpgrp(shell_terminal, job.pgid);
+    if (continueJob) {
+        if (kill(-job.pgid, SIGCONT) < 0)
+            cerr << "error: kill SIGCONT" << endl;
+    }
+    waitJob(job);
+
+    /* Put the shell back in the foreground.  */
+    tcsetpgrp (shell_terminal, shell_pgid);
+
+    initTermios();
+}
+
+void Shell::putJobBackground(Job& job, bool continueJob) {
+    if (continueJob && job.status != JobWaitingInput)
+        job.status = JobWaitingInput;
+    if (continueJob)
+        if (kill(-job.pgid, SIGCONT) < 0)
+            cerr << "error: kill SIGCONT" << endl;
+
+    tcsetpgrp(shell_terminal, shell_pgid);
+}
+
+
+void Shell::waitJob(Job& job) {
+    int terminationStatus;
+    while (waitpid(job.pid, &terminationStatus, WUNTRACED | WNOHANG) == 0) {
+        jobManager.Get(job.pid, job);
+        if (job.status == JobSuspended) {
+            return;
+        }
+    }
+    jobManager.Delete(job);
+}
+
+void Shell::killJob(Job& job) {
+    kill(job.pid, SIGKILL);
 }
