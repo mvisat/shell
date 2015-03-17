@@ -367,8 +367,6 @@ void Shell::executeCommand(vector<string>& vCommand) {
                 int status;
                 pid_t pid = fork();
                 if (pid == 0) {
-                    resetTermios();
-
                     // STDIN, diubah sesuai yang ada di reference
                     int fileInput = -1;
                     for (unsigned int i = 0; fileInput == -1 && i < vCommand.size(); ++i) {
@@ -412,8 +410,10 @@ void Shell::executeCommand(vector<string>& vCommand) {
                     setpgrp();
                     if (background)
                         cout << endl << "[" << jobManager.GetActiveJobs() << "] " << getpid() << endl;
-                    else
+                    else {
+                        resetTermios();
                         tcsetpgrp(shell_terminal, pid);
+                    }
 
                     /* Set the handling for job control signals back to the default.  */
                     signal (SIGINT, SIG_DFL);
@@ -582,6 +582,8 @@ string Shell::readline() {
 }
 
 void Shell::putJobForeground(Job& job, bool continueJob) {
+    resetTermios();
+    jobManager.Change(job.pid, JobForeground);
     job.status = JobForeground;
     tcsetpgrp(shell_terminal, job.pgid);
     if (continueJob) {
@@ -597,8 +599,10 @@ void Shell::putJobForeground(Job& job, bool continueJob) {
 }
 
 void Shell::putJobBackground(Job& job, bool continueJob) {
-    if (continueJob && job.status != JobWaitingInput)
+    if (continueJob && job.status != JobWaitingInput) {
         job.status = JobWaitingInput;
+        jobManager.Change(job.pid, JobWaitingInput);
+    }
     if (continueJob)
         if (kill(-job.pgid, SIGCONT) < 0)
             cerr << "error: kill SIGCONT" << endl;
